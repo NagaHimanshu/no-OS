@@ -81,19 +81,26 @@ enum iiod_opcode {
 	IIOD_OP_RESPONSE,
 	IIOD_OP_PRINT,
 	IIOD_OP_TIMEOUT,
+
 	IIOD_OP_READ_ATTR,
 	IIOD_OP_READ_DBG_ATTR,
 	IIOD_OP_READ_BUF_ATTR,
 	IIOD_OP_READ_CHN_ATTR,
+	IIOD_OP_READ_DEV_EVT_ATTR,
+	IIOD_OP_READ_CHN_EVT_ATTR,
+
 	IIOD_OP_WRITE_ATTR,
 	IIOD_OP_WRITE_DBG_ATTR,
 	IIOD_OP_WRITE_BUF_ATTR,
 	IIOD_OP_WRITE_CHN_ATTR,
+	IIOD_OP_WRITE_DEV_EVT_ATTR,
+	IIOD_OP_WRITE_CHN_EVT_ATTR,
+
 	IIOD_OP_GETTRIG,
 	IIOD_OP_SETTRIG,
 
-	IIOD_OP_CREATE_BUFFER,
-	IIOD_OP_FREE_BUFFER,
+	IIOD_OP_OPEN_BUFFER,
+	IIOD_OP_CLOSE_BUFFER,
 	IIOD_OP_ENABLE_BUFFER,
 	IIOD_OP_DISABLE_BUFFER,
 
@@ -168,6 +175,43 @@ struct iiod_buff {
 	char *buf;
 	uint32_t idx;
 	uint32_t len;
+};
+
+/*
+ * Protocol binding for one libiio v1 block, private to the iiod layer.
+ *
+ * This is the no-OS equivalent of libiio's iiod daemon "struct block_entry"
+ * (iiod/ops.h): it holds only what the wire protocol needs to answer a block.
+ * The block storage itself belongs to the iio layer (struct iio_block), which
+ * never learns what a protocol client id is.
+ */
+struct iiod_block_entry {
+	/* Block index as assigned by the client, from cmd->code >> 16 */
+	uint16_t idx;
+	/* Client ID the response header must be stamped with */
+	uint16_t cl_id;
+	/* Cleared by FREE_BLOCK; a dead entry is never served */
+	bool live;
+};
+
+/*
+ * Blocks created by a client for one device buffer. Equivalent of libiio's
+ * "struct buffer_entry": it binds a connection and a device to a block list.
+ */
+struct iio_stream {
+	struct iiod_block_entry blocks[MAX_NUM_BLOCKS];
+	/* Number of blocks created so far */
+	uint32_t nb_blocks;
+	/*
+	 * Device this buffer was opened on. Needed because the block drain runs
+	 * outside the command that enqueued the credit, so the command's own
+	 * device field cannot be used there.
+	 */
+	uint16_t dev;
+	/* Set once ENABLE_BUFFER has opened the device buffer */
+	bool started;
+	/* Channel mask from OPEN_BUFFER, needed at ENABLE_BUFFER */
+	uint32_t mask;
 };
 
 struct iiod_command {
@@ -264,10 +308,9 @@ struct iiod_conn_priv {
 	struct iiod_event_desc events;
 	/* Buffer to store the event data for transfer */
 	uint8_t event_data[MAX_NUM_EVENTS];
-	uint16_t block_ids[MAX_NUM_BLOCKS];
 
 	struct lf256fifo *fifo_stream;
-	struct iio_stream *stream;
+	struct iio_stream stream;
 };
 
 /* Private iiod information */

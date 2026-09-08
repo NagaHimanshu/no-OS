@@ -121,7 +121,7 @@ struct iiod_ops {
 	int (*read_buffer)(struct iiod_ctx *ctx, const void *device, char *buf,
 			   uint32_t bytes);
 	/* Called to notify that buffer must be refiiled */
-	int (*refill_buffer)(struct iiod_ctx *ctx, const void *device, uint8_t block_id);
+	int (*refill_buffer)(struct iiod_ctx *ctx, const void *device, uint16_t block_idx);
 
 	/* Write data to opened buffer */
 	int (*write_buffer)(struct iiod_ctx *ctx, const void *device,
@@ -155,9 +155,32 @@ struct iiod_ops {
 	int (*set_buffers_count)(struct iiod_ctx *ctx, const void *device,
 				 uint32_t buffers_count);
 
-	int (*create_block)(struct iiod_ctx *ctx, const void *device, struct iio_block *block, uint32_t block_size_bytes);
-	int (*pre_enable)(struct iiod_ctx *ctx, const void *device, uint32_t mask, uint16_t *block_ids);
+	/*
+	 * Configure and enable the device buffer for binary (libiio v1) mode.
+	 *
+	 * Called on ENABLE_BUFFER, which is the first point at which the channel
+	 * mask is known. The blocks have already been created, so their sizes
+	 * are taken from them.
+	 */
+	int (*pre_enable)(struct iiod_ctx *ctx, const void *device, uint32_t mask);
 
+	/* Equivalent of iio_block_create: carve storage for one block. */
+	int (*create_block)(struct iiod_ctx *ctx, const void *device,
+			    uint16_t block_idx, uint32_t size);
+
+				/* Equivalent of iio_block_free. */
+	int (*free_block)(struct iiod_ctx *ctx, const void *device,
+			  uint16_t block_idx);
+	/*
+	 * Non-blocking equivalent of iio_block_dequeue. Returns 0 and sets
+	 * addr/bytes_used when the producer is done, -EAGAIN while it is still
+	 * filling. bytes_used may be smaller than the block size. The block
+	 * keeps its contents afterwards, so addr stays valid until the block is
+	 * re-enqueued or released.
+	 */
+	int (*block_ready)(struct iiod_ctx *ctx, const void *device,
+			   uint16_t block_idx, void **addr,
+			   uint32_t *bytes_used);
 	int (*create_event_stream)(struct iiod_ctx *ctx, const void *device, const uint32_t priv);
 	int (*read_event)(struct iiod_ctx *ctx, const void *device, const uint32_t priv, uint8_t *buf);
 	int (*free_event_stream)(struct iiod_ctx *ctx, const void *device, const uint32_t priv);
