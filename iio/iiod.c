@@ -344,13 +344,17 @@ int32_t iiod_parse_command(char *buf, struct comand_desc *res)
 			data->attr = (uint16_t) (cmd->code >> 16);
 			data->channel = (uint16_t) cmd->code;
 			return 0;
+		/* New in stable v1.0: event attribute read ops — unsupported, return -ENOTSUP */
+		case IIOD_OP_READ_DEV_EVT_ATTR:
+		case IIOD_OP_READ_CHN_EVT_ATTR:
+			return -ENOTSUP;
 		case IIOD_OP_FREE_BLOCK:
-		case IIOD_OP_FREE_BUFFER:
+		case IIOD_OP_CLOSE_BUFFER:
 			data->block_id = (int16_t)(cmd->code >> 16);
 			return 0;
 		case IIOD_OP_GETTRIG:
 		case IIOD_OP_SETTRIG:
-			return 0; // TODO: Check what to do here
+			return 0;
 	default:
 		break;
 	}
@@ -359,43 +363,49 @@ int32_t iiod_parse_command(char *buf, struct comand_desc *res)
 		case IIOD_OP_WRITE_ATTR:
 			res->type = IIO_ATTR_TYPE_DEVICE;
 			data->attr = (uint16_t) (cmd->code >> 16);
-			// TODO: iiod_client sends a 8byte length. Same for all write attribute Op.
-			res->bytes_count = *(uint32_t *)payload;
+			/* stable v1.0 client sends 8-byte (uint64_t) length; lower 32 bits hold the count */
+			res->bytes_count = (uint32_t)(*(uint64_t *)payload);
 			return 0;
 		case IIOD_OP_WRITE_DBG_ATTR:
 			res->type = IIO_ATTR_TYPE_DEBUG;
 			data->attr = (uint16_t) (cmd->code >> 16);
-			res->bytes_count = *(uint32_t *)payload;
+			res->bytes_count = (uint32_t)(*(uint64_t *)payload);
 			return 0;
 		case IIOD_OP_WRITE_BUF_ATTR:
 			res->type = IIO_ATTR_TYPE_BUFFER;
 			data->attr = (uint16_t) (cmd->code >> 16);
 			data->buffer = (uint16_t) cmd->code;
-			res->bytes_count = *(uint32_t *)payload;
+			res->bytes_count = (uint32_t)(*(uint64_t *)payload);
 			return 0;
 		case IIOD_OP_WRITE_CHN_ATTR:
 			res->type = IIO_ATTR_TYPE_CH_OUT;
 			data->attr = (uint16_t) (cmd->code >> 16);
 			data->channel = (uint16_t) cmd->code;
-			res->bytes_count = *(uint32_t *)payload;
+			res->bytes_count = (uint32_t)(*(uint64_t *)payload);
 			return 0;
-		case IIOD_OP_CREATE_BUFFER:
-			res->mask = ((uint32_t *)payload)[2];
+		/* New in stable v1.0: event attribute write ops — consume payload, return -ENOTSUP */
+		case IIOD_OP_WRITE_DEV_EVT_ATTR:
+		case IIOD_OP_WRITE_CHN_EVT_ATTR:
+			res->bytes_count = (uint32_t)(*(uint64_t *)payload);
+			return 0;
+		case IIOD_OP_OPEN_BUFFER:
+			/* Stable v1.0: payload is just the mask word array (first word at offset 0) */
+			res->mask = ((uint32_t *)payload)[0];
 			return 0;
 		case IIOD_OP_DISABLE_BUFFER:
 		case IIOD_OP_CREATE_BLOCK:
-			data->bytes_size = *(uint32_t *)payload; //TODO: Is this correct. We read 8 bytes payload but only use 4?
+			data->bytes_size = *(uint32_t *)payload;
 			return 0;
 		case IIOD_OP_TRANSFER_BLOCK:
 			data->block_id = (int16_t)(cmd->code >> 16);
-			data->bytes_size = *(uint32_t *)payload; //TODO: Is this correct. We read 8 bytes payload but only use 4?
+			data->bytes_size = *(uint32_t *)payload;
 			return 0;
 		case IIOD_OP_ENQUEUE_BLOCK_CYCLIC:
 		case IIOD_OP_RETRY_DEQUEUE_BLOCK:
 		default:
 			break;
 	}
-	
+
 	return -EINVAL;
 }
 
@@ -1029,35 +1039,36 @@ static int32_t iiod_read_cmd_payload(struct iiod_desc *desc,
 		case IIOD_OP_READ_DBG_ATTR:
 		case IIOD_OP_READ_BUF_ATTR:
 		case IIOD_OP_READ_CHN_ATTR:
+		case IIOD_OP_READ_DEV_EVT_ATTR:
+		case IIOD_OP_READ_CHN_EVT_ATTR:
 		case IIOD_OP_ENABLE_BUFFER:
 		case IIOD_OP_CREATE_EVSTREAM:
 		case IIOD_OP_FREE_EVSTREAM:
 		case IIOD_OP_READ_EVENT:
+		case IIOD_OP_GETTRIG:
+		case IIOD_OP_SETTRIG:
+		case IIOD_OP_CLOSE_BUFFER:
+		case IIOD_OP_FREE_BLOCK:
 			return 0;
 		case IIOD_OP_WRITE_ATTR:
 		case IIOD_OP_WRITE_DBG_ATTR:
 		case IIOD_OP_WRITE_BUF_ATTR:
 		case IIOD_OP_WRITE_CHN_ATTR:
+		case IIOD_OP_WRITE_DEV_EVT_ATTR:
+		case IIOD_OP_WRITE_CHN_EVT_ATTR:
 			payload_len = 8;
 			break;
-		case IIOD_OP_GETTRIG:
-		case IIOD_OP_SETTRIG:
-			return 0; // TODO: Check what to do here
-		case IIOD_OP_CREATE_BUFFER:
-			//TODO: This'll only be valid for 32 channels. The format of data is
-			// dma_allocator(4B), mask_count (4B), masks (LSB ... MSB)
-			payload_len = 12;
+		case IIOD_OP_OPEN_BUFFER:
+			/* Stable v1.0 sends mask->words * 4 bytes (just the mask array).
+			 * For ≤ 32 channels (1 mask word) this is 4 bytes. */
+			payload_len = 4;
 			break;
 		case IIOD_OP_DISABLE_BUFFER:
+			return 0;  /* No payload — stable client sends header only */
 		case IIOD_OP_CREATE_BLOCK:
-			payload_len = 8;
-			break;
 		case IIOD_OP_TRANSFER_BLOCK:
 			payload_len = 8;
 			break;
-		case IIOD_OP_FREE_BLOCK:
-		case IIOD_OP_FREE_BUFFER:
-			return 0;
 		case IIOD_OP_ENQUEUE_BLOCK_CYCLIC:
 		case IIOD_OP_RETRY_DEQUEUE_BLOCK:
 		default:
@@ -1175,7 +1186,13 @@ static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 		conn->res.buf.len = 0;
 		break;
 
-	case IIOD_OP_CREATE_BUFFER:
+	case IIOD_OP_WRITE_DEV_EVT_ATTR:
+	case IIOD_OP_WRITE_CHN_EVT_ATTR:
+		/* Event attribute writes are not supported; send clean error. */
+		ret = -ENOTSUP;
+		goto command_fail;
+
+	case IIOD_OP_OPEN_BUFFER:
 		conn->res.buf.len = 0;
 		break;
 
@@ -1217,15 +1234,21 @@ static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 	case IIOD_OP_TRANSFER_BLOCK:
 		uint8_t wr = data->block_id;
 
-		//enqueue buf idx
-		lf256fifo_write(fifo_stream, wr);
-
 		if (stream->started) {
-			lf256fifo_get(fifo_stream, &wr);
+			/* Stream is running: write block_id to fifo so IIOD_WRITING_BUF_DATA
+			 * can detect when DMA fills it and push data to the client.
+			 * Call refill_buffer directly (async DMA start). */
+			lf256fifo_write(fifo_stream, wr);
 			ret = desc->ops.refill_buffer(&ctx, &data->device, wr);
-			if (NO_OS_IS_ERR_VALUE(ret))	
-				return ret; // TODO: Shouldn't return ret. Instead should send an error response
+			if (NO_OS_IS_ERR_VALUE(ret)) {
+				IIOD_SET_ERROR_RESPONSE(conn->res_header, ret);
+				conn->res.buf.len = 0;
+				conn->state = IIOD_WRITING_BIN_RESPONSE;
+				return 0;
+			}
 		} else {
+			/* Pre-stream: accumulate block_ids for pre_enable */
+			lf256fifo_write(fifo_stream, wr);
 			conn->block_ids[stream->curr] = wr;
 			stream->curr++;
 			if (stream->curr == stream->nb_blocks) {
@@ -1251,12 +1274,55 @@ static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 
 	case IIOD_OP_FREE_BLOCK:
 
+//		TODO: The below approach gives heap=0 but results in a 10-sec delay during
+//		destroy buffer(). Need to investigate. But this approach follows clean stop
+//		of transfer and then freeing blocks that were assigned for transfer
+//		conn->res.buf.len = 0;
+//		/* Reverse-order teardown: stop DMA before freeing any block memory.
+//		 * Without this, the DMA ISR can write to blocks_g[map[slot]]->bytes_used
+//		 * after block->data has already been freed, which is use-after-free.
+//		 *
+//		 * ops.close() → iio_close_dev → frees circular buffer → post_disable →
+//		 * end_transfer (stops DMA, resets nb_of_blocks / blocks_g[]).
+//		 *
+//		 * end_transfer resets the APP-level nb_of_blocks but does NOT touch
+//		 * stream->nb_blocks, so the loop below can still iterate correctly. */
+//		if (stream->started) {
+//			stream->started = false;
+//			ret = desc->ops.close(&ctx, &data->device);
+//			if (NO_OS_IS_ERR_VALUE(ret))
+//				goto command_fail;
+//		}
+//
+//		if (stream && stream->blocks) {
+//			for (i = 0; i < stream->nb_blocks; i++) {
+//				if (stream->blocks[i]) {
+//					if (stream->blocks[i]->cl_id == (data->block_id + 1)) {
+//						no_os_free(stream->blocks[i]->data);
+//						stream->blocks[i]->data = NULL;
+//						no_os_free(stream->blocks[i]);
+//						stream->blocks[i] = NULL;
+//						continue;
+//					}
+//					block_count++;
+//				}
+//			}
+//			if (!block_count) {
+//				/* All blocks freed. Reset iiod-layer count so the next session's
+//				 * CREATE_BLOCK starts at index 0. Keep stream->blocks array
+//				 * allocated — it is reused by the next client session.
+//				 * ops.close() was already called above (started guard). */
+//				stream->nb_blocks = 0;
+//			}
+//		}
+
 		conn->res.buf.len = 0;
 		if (stream && stream->blocks) {
 			for (i = 0; i < stream->nb_blocks; i++) {
 				if (stream->blocks[i]) {
 					if (stream->blocks[i]->cl_id == (data->block_id + 1)) {
-//						no_os_free(stream->blocks[i]->data); // TODO: Call block free callback to delete the data.
+						no_os_free(stream->blocks[i]->data);
+						stream->blocks[i]->data = NULL;
 						no_os_free(stream->blocks[i]);
 						stream->blocks[i] = NULL;
 						continue;
@@ -1265,25 +1331,39 @@ static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 				}
 			}
 			if (!block_count) {
-				no_os_free(stream->blocks);
-				stream->blocks = NULL;
+				/* All blocks freed. Reset iiod-layer count so the next session's
+				 * CREATE_BLOCK starts at index 0. Keep stream->blocks array
+				 * allocated — it is reused by the next client session. */
 				stream->nb_blocks = 0;
-
-				//Dealloc blocks created
 				stream->started = false;
-
-				//TODO: Close for individual blocks instead of all blocks at once.
 				ret = desc->ops.close(&ctx, &data->device);
 			}
 		}
 
 		break;
 
-	case IIOD_OP_FREE_BUFFER:
+	case IIOD_OP_CLOSE_BUFFER:
 		conn->res.buf.len = 0;
-		stream->curr =0;
-		//dealloc buffer
-
+		stream->curr = 0;
+		/* Free any blocks not already freed by FREE_BLOCK (abort / error path).
+		 * If nb_blocks is still > 0 here the device was never closed: close it. */
+		if (stream && stream->blocks) {
+			for (i = 0; i < MAX_NUM_BLOCKS; i++) {
+				if (stream->blocks[i]) {
+					no_os_free(stream->blocks[i]->data);
+					stream->blocks[i]->data = NULL;
+					no_os_free(stream->blocks[i]);
+					stream->blocks[i] = NULL;
+				}
+			}
+			if (stream->nb_blocks > 0) {
+				stream->nb_blocks = 0;
+				stream->started = false;
+				ret = desc->ops.close(&ctx, &data->device);
+			}
+		}
+		/* Drain any stale block IDs from the previous session. */
+		lf256fifo_flush(conn->fifo_stream);
 		break;
 
 	case IIOD_OP_RETRY_DEQUEUE_BLOCK:
@@ -1441,8 +1521,9 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 		case IIOD_WRITING_BUF_DATA:
 			if(conn->stream->started) {
 				if(!lf256fifo_is_empty(conn->fifo_stream)) {
-					lf256fifo_get(conn->fifo_stream, &c);
+					lf256fifo_get(conn->fifo_stream, &c);  /* peek */
 					if(conn->stream->blocks[c]->bytes_used == conn->stream->blocks[c]->size) {
+						/* Block is filled by DMA — send response + data to client */
 						IIOD_SET_RESPONSE(conn->res_header,
 								conn->stream->blocks[c]->cl_id,
 								0,
@@ -1462,10 +1543,12 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 
 						conn->stream->blocks[c]->bytes_used = 0;
 
-						ret = lf256fifo_read(conn->fifo_stream, &c);
-						if (NO_OS_IS_ERR_VALUE(ret))
-							return ret;
+						/* Pop the sent block_id. Empty fifo is normal. */
+						lf256fifo_read(conn->fifo_stream, &c);
 					}
+					/* Block not ready yet — fifo still has block_id (peek, not pop).
+					 * Fall through to IIOD_READING_LINE; next iteration will
+					 * return EAGAIN → loop back here to re-check bytes_used. */
 				}
 			}
 
@@ -1506,8 +1589,8 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 				conn->res.write_val = 0;
 				conn->state = IIOD_WRITING_BIN_RESPONSE;
 			} else if ((data->op_code >= IIOD_OP_WRITE_ATTR) &&
-					(data->op_code <= IIOD_OP_WRITE_CHN_ATTR)){
-				/* Special case. Attribute needs to be read */
+					(data->op_code <= IIOD_OP_WRITE_CHN_EVT_ATTR)){
+				/* Attribute write: read the value bytes from the client first */
 				conn->nb_buf.buf = conn->payload_buf;
 				conn->nb_buf.len = conn->cmd_data.bytes_count;
 				conn->nb_buf.idx = 0;
@@ -1519,12 +1602,17 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 	case IIOD_RUNNING_CMD:
 		/* Execute or call necessary ops depending on cmd. No I/O */
 		ret = iiod_run_cmd_new(desc, conn);
-		if (NO_OS_IS_ERR_VALUE(ret))
-			return ret;
+		if (NO_OS_IS_ERR_VALUE(ret)) {
+			/* Send error response so client is never left hanging */
+			IIOD_SET_ERROR_RESPONSE(conn->res_header, ret);
+			conn->res.buf.len = 0;
+			conn->state = IIOD_WRITING_BIN_RESPONSE;
+			return 0;
+		}
 
 		if ((data->op_code == IIOD_OP_TRANSFER_BLOCK) ||
 			(data->op_code == IIOD_OP_READ_EVENT))
-			conn->state = IIOD_LINE_DONE; //READ
+			conn->state = IIOD_LINE_DONE;
 		else
 			conn->state = IIOD_WRITING_BIN_RESPONSE;
 		return 0;

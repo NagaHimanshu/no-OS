@@ -78,34 +78,40 @@ enum iiod_cmd {
 };
 
 enum iiod_opcode {
-	IIOD_OP_RESPONSE,
-	IIOD_OP_PRINT,
-	IIOD_OP_TIMEOUT,
-	IIOD_OP_READ_ATTR,
-	IIOD_OP_READ_DBG_ATTR,
-	IIOD_OP_READ_BUF_ATTR,
-	IIOD_OP_READ_CHN_ATTR,
-	IIOD_OP_WRITE_ATTR,
-	IIOD_OP_WRITE_DBG_ATTR,
-	IIOD_OP_WRITE_BUF_ATTR,
-	IIOD_OP_WRITE_CHN_ATTR,
-	IIOD_OP_GETTRIG,
-	IIOD_OP_SETTRIG,
+	IIOD_OP_RESPONSE,           /* 0 */
+	IIOD_OP_PRINT,              /* 1 */
+	IIOD_OP_TIMEOUT,            /* 2 */
+	IIOD_OP_READ_ATTR,          /* 3 */
+	IIOD_OP_READ_DBG_ATTR,      /* 4 */
+	IIOD_OP_READ_BUF_ATTR,      /* 5 */
+	IIOD_OP_READ_CHN_ATTR,      /* 6 */
+	/* 7-8: new read event attr ops added in stable libiio v1.0 */
+	IIOD_OP_READ_DEV_EVT_ATTR,  /* 7 */
+	IIOD_OP_READ_CHN_EVT_ATTR,  /* 8 */
+	IIOD_OP_WRITE_ATTR,         /* 9  (was 7) */
+	IIOD_OP_WRITE_DBG_ATTR,     /* 10 (was 8) */
+	IIOD_OP_WRITE_BUF_ATTR,     /* 11 (was 9) */
+	IIOD_OP_WRITE_CHN_ATTR,     /* 12 (was 10) */
+	/* 13-14: new write event attr ops added in stable libiio v1.0 */
+	IIOD_OP_WRITE_DEV_EVT_ATTR, /* 13 */
+	IIOD_OP_WRITE_CHN_EVT_ATTR, /* 14 */
+	IIOD_OP_GETTRIG,            /* 15 (was 11) */
+	IIOD_OP_SETTRIG,            /* 16 (was 12) */
 
-	IIOD_OP_CREATE_BUFFER,
-	IIOD_OP_FREE_BUFFER,
-	IIOD_OP_ENABLE_BUFFER,
-	IIOD_OP_DISABLE_BUFFER,
+	IIOD_OP_OPEN_BUFFER,        /* 17 (was CREATE_BUFFER=13) */
+	IIOD_OP_CLOSE_BUFFER,       /* 18 (was FREE_BUFFER=14) */
+	IIOD_OP_ENABLE_BUFFER,      /* 19 (was 15) */
+	IIOD_OP_DISABLE_BUFFER,     /* 20 (was 16) */
 
-	IIOD_OP_CREATE_BLOCK,
-	IIOD_OP_FREE_BLOCK,
-	IIOD_OP_TRANSFER_BLOCK,
-	IIOD_OP_ENQUEUE_BLOCK_CYCLIC,
-	IIOD_OP_RETRY_DEQUEUE_BLOCK,
+	IIOD_OP_CREATE_BLOCK,       /* 21 (was 17) */
+	IIOD_OP_FREE_BLOCK,         /* 22 (was 18) */
+	IIOD_OP_TRANSFER_BLOCK,     /* 23 (was 19) */
+	IIOD_OP_ENQUEUE_BLOCK_CYCLIC, /* 24 (was 20) */
+	IIOD_OP_RETRY_DEQUEUE_BLOCK,  /* 25 (was 21) */
 
-	IIOD_OP_CREATE_EVSTREAM,
-	IIOD_OP_FREE_EVSTREAM,
-	IIOD_OP_READ_EVENT,
+	IIOD_OP_CREATE_EVSTREAM,    /* 26 (was 22) */
+	IIOD_OP_FREE_EVSTREAM,      /* 27 (was 23) */
+	IIOD_OP_READ_EVENT,         /* 28 (was 24) */
 
 	IIOD_NB_OPCODES,
 };
