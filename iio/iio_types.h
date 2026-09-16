@@ -256,7 +256,8 @@ struct iio_block {
 	uint32_t size;
 	uint16_t cl_id;
 
-	uint32_t bytes_used;
+	/* Written by the capture ISR, polled by the iiod state machine */
+	volatile uint32_t bytes_used;
 };
 
 struct iio_stream {

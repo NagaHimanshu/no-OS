@@ -1231,9 +1231,9 @@ static struct iio_attribute *get_attribute(struct iiod_attr *attr,
 		struct iio_dev_priv *dev,
 		struct iio_channel *ch)
 {
-	struct iio_attribute *attributes;
-	uint16_t *sorted_attr;
-	uint32_t i;
+	struct iio_attribute *attributes = NULL;
+	uint16_t *sorted_attr = NULL;
+	uint32_t i = 0;
 
 	switch (attr->type) {
 	case IIO_ATTR_TYPE_DEBUG:
@@ -1480,7 +1480,7 @@ static int iio_write_attr_new(struct iiod_ctx *ctx, const uint16_t *device,
 	struct iio_trig_priv *trig_dev = NULL;
 	struct iio_dev_priv *dev = NULL;
 	struct iio_channel *ch = NULL;
-	int8_t ch_out;
+	int8_t ch_out = (attr->type == IIO_ATTR_TYPE_CH_OUT) ? 1 : 0;
 
 	dev = get_iio_device(ctx->instance, device, ctx->binary);
 
