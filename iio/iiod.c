@@ -393,7 +393,17 @@ int32_t iiod_parse_command(char *buf, struct comand_desc *res)
 			res->mask = ((uint32_t *)payload)[0];
 			return 0;
 		case IIOD_OP_DISABLE_BUFFER:
+			data->bytes_size = *(uint32_t *)payload;
+			return 0;
 		case IIOD_OP_CREATE_BLOCK:
+			/*
+			 * The block index is carried in the upper half of code
+			 * exactly as for TRANSFER_BLOCK. Without it the server
+			 * would have to key blocks by arrival order, which
+			 * diverges permanently from the client after a single
+			 * reordered or lost CREATE_BLOCK.
+			 */
+			data->block_id = (int16_t)(cmd->code >> 16);
 			data->bytes_size = *(uint32_t *)payload;
 			return 0;
 		case IIOD_OP_TRANSFER_BLOCK:
@@ -420,7 +430,27 @@ static int dummy_close(struct iiod_ctx *ctx, const void *device)
 	return -EINVAL;
 }
 
-static int dummy_refill_buffer(struct iiod_ctx *ctx, const void *device, uint8_t block_id)
+static int dummy_refill_buffer(struct iiod_ctx *ctx, const void *device,
+			       uint16_t block_idx)
+{
+	return -EINVAL;
+}
+
+static int dummy_create_block(struct iiod_ctx *ctx, const void *device,
+			      uint16_t block_idx, uint32_t size)
+{
+	return -EINVAL;
+}
+
+static int dummy_free_block(struct iiod_ctx *ctx, const void *device,
+			    uint16_t block_idx)
+{
+	return -EINVAL;
+}
+
+static int dummy_block_ready(struct iiod_ctx *ctx, const void *device,
+			     uint16_t block_idx, void **addr,
+			     uint32_t *bytes_used)
 {
 	return -EINVAL;
 }
@@ -454,11 +484,8 @@ static int dummy_set_buffers_count(struct iiod_ctx *ctx, const void *device,
 	return -EINVAL;
 }
 
-static int dummy_create_block(struct iiod_ctx *ctx, const void *device, struct iio_block *block, uint32_t block_size_bytes){
-	return -EINVAL;
-}
-
-static int dummy_pre_enable(struct iiod_ctx *ctx, const void *device, uint32_t mask, uint16_t *block_ids){
+static int dummy_pre_enable(struct iiod_ctx *ctx, const void *device, uint32_t mask)
+{
 	return -EINVAL;
 }
 
@@ -497,9 +524,14 @@ int32_t iiod_copy_ops(struct iiod_ops *ops, struct iiod_ops *new_ops)
 				 dummy_set_buffers_count);
 	ops->refill_buffer = SET_DUMMY_IF_NULL(new_ops->refill_buffer,
 					       dummy_refill_buffer);
+	ops->create_block = SET_DUMMY_IF_NULL(new_ops->create_block,
+					      dummy_create_block);
+	ops->free_block = SET_DUMMY_IF_NULL(new_ops->free_block,
+					    dummy_free_block);
+	ops->block_ready = SET_DUMMY_IF_NULL(new_ops->block_ready,
+					     dummy_block_ready);
 	ops->push_buffer = SET_DUMMY_IF_NULL(new_ops->push_buffer,
 					     dummy_close);
-	ops->create_block = SET_DUMMY_IF_NULL(new_ops->create_block, dummy_create_block);
 	ops->pre_enable = SET_DUMMY_IF_NULL(new_ops->pre_enable, dummy_pre_enable);
 	ops->create_event_stream = SET_DUMMY_IF_NULL(new_ops->create_event_stream, dummy_create_event_stream);
 	ops->read_event = SET_DUMMY_IF_NULL(new_ops->read_event, dummy_read_event);
@@ -615,14 +647,8 @@ int32_t iiod_conn_add(struct iiod_desc *desc, struct iiod_conn_data *data,
 			*new_conn_id = i;
 
 			ret = lf256fifo_init(&conn->fifo_stream);
-
-			conn->stream = no_os_calloc(1, sizeof(struct iio_stream));
-			 if (!conn->stream)
-			 	return -ENOMEM;
-
-			conn->stream->blocks = no_os_calloc(MAX_NUM_BLOCKS, sizeof(*conn->stream->blocks));
-			 if (!conn->stream->blocks)
-			 	return -ENOMEM;
+			if (NO_OS_IS_ERR_VALUE(ret))
+				return ret;
 
 			ret = iiod_set_protocol(conn, IIOD_ASCII_COMMAND);
 			if (NO_OS_IS_ERR_VALUE(ret)) {
@@ -1103,6 +1129,58 @@ end:
 	return ret;
 }
 
+static struct iiod_block_entry *iiod_stream_find(struct iio_stream *stream,
+						 uint16_t idx)
+{
+	uint32_t i;
+
+	for (i = 0; i < stream->nb_blocks; i++)
+		if (stream->blocks[i].live && stream->blocks[i].idx == idx)
+			return &stream->blocks[i];
+
+	return NULL;
+}
+
+/*
+ * Answer one block on its own client id. Used where the command handler cannot
+ * produce the reply itself, either because the opcode sends no command response
+ * (TRANSFER_BLOCK) or because several blocks must be answered at once.
+ */
+static void iiod_send_block_error(struct iiod_desc *desc,
+				  struct iiod_conn_priv *conn, uint16_t cl_id,
+				  uint16_t dev, int32_t err)
+{
+	struct iiod_ctx ctx = IIOD_CTX(desc, conn);
+	struct iiod_command res;
+
+	IIOD_SET_RESPONSE(res, cl_id, dev, err);
+	desc->ops.send(&ctx, (uint8_t *)&res, sizeof(res));
+}
+
+/*
+ * Every enqueued block owes the client exactly one response on its own client
+ * id; dropping a credit would leave iiod_io_wait_for_response() blocked
+ * forever. Answer all outstanding credits with an error, then drop them.
+ *
+ * A block the client already freed is skipped: iiod_client_free_block()
+ * cancels that block's io before sending FREE_BLOCK, so nothing awaits it.
+ */
+static void iiod_fail_pending_blocks(struct iiod_desc *desc,
+				     struct iiod_conn_priv *conn, int32_t err)
+{
+	struct iiod_block_entry *entry;
+	uint8_t idx;
+
+	while (!lf256fifo_read(conn->fifo_stream, &idx)) {
+		entry = iiod_stream_find(&conn->stream, idx);
+		if (!entry)
+			continue;
+
+		iiod_send_block_error(desc, conn, entry->cl_id,
+				      conn->stream.dev, err);
+	}
+}
+
 static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 					struct iiod_conn_priv *conn)
 {
@@ -1121,8 +1199,11 @@ static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 		.ch_id = -1
 	};
 
-	struct iio_stream *stream = conn->stream;
+	struct iio_stream *stream = &conn->stream;
+	struct iiod_block_entry *entry;
 	uint32_t block_count = 0;
+	uint8_t pending;
+	uint8_t pending_list[MAX_NUM_BLOCKS];
 	struct lf256fifo *fifo_stream = conn->fifo_stream;
 	struct iiod_event_client *client_desc;
 
@@ -1193,6 +1274,26 @@ static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 		goto command_fail;
 
 	case IIOD_OP_OPEN_BUFFER:
+		/*
+		 * Blocks are created next, so nothing can be sized yet. Reclaim
+		 * anything a previous session abandoned — stopping the device
+		 * first, because releasing storage under a live producer would
+		 * race the completion context — then remember the mask.
+		 */
+		if (stream->started) {
+			stream->started = false;
+			desc->ops.close(&ctx, &data->device);
+		}
+
+		for (i = 0; i < (int)stream->nb_blocks; i++)
+			if (stream->blocks[i].live)
+				desc->ops.free_block(&ctx, &data->device,
+						     stream->blocks[i].idx);
+
+		stream->mask = cmd_desc->mask;
+		stream->dev = data->device;
+		stream->nb_blocks = 0;
+		lf256fifo_flush(fifo_stream);
 		conn->res.buf.len = 0;
 		break;
 
@@ -1210,160 +1311,162 @@ static int32_t iiod_run_cmd_new(struct iiod_desc *desc,
 			goto command_fail;
 		}
 
-		stream->blocks[stream->nb_blocks] = no_os_calloc(1, sizeof(*stream->blocks[stream->nb_blocks]));
-		if (!stream->blocks[stream->nb_blocks]) {
-			ret = -ENOMEM;
+		if (!data->bytes_size) {
+			ret = -EINVAL;
 			goto command_fail;
 		}
 
-		if(desc->ops.create_block) {
-			ret = desc->ops.create_block(&ctx, &data->device,
-							 stream->blocks[stream->nb_blocks], data->bytes_size);
-			if (NO_OS_IS_ERR_VALUE(ret)) {
-				goto command_fail;
-			}
+		if (iiod_stream_find(stream, data->block_id)) {
+			ret = -EEXIST;
+			goto command_fail;
 		}
 
-		stream->blocks[stream->nb_blocks]->cl_id = data->client_id;
-		stream->blocks[stream->nb_blocks]->size = data->bytes_size;
+		ret = desc->ops.create_block(&ctx, &data->device, data->block_id,
+					     data->bytes_size);
+		if (NO_OS_IS_ERR_VALUE(ret))
+			goto command_fail;
 
+		stream->blocks[stream->nb_blocks].cl_id = data->client_id;
+		stream->blocks[stream->nb_blocks].idx = data->block_id;
+		stream->blocks[stream->nb_blocks].live = true;
 		stream->nb_blocks++;
 
 		break;
 
 	case IIOD_OP_TRANSFER_BLOCK:
-		uint8_t wr = data->block_id;
-
-		if (stream->started) {
-			/* Stream is running: write block_id to fifo so IIOD_WRITING_BUF_DATA
-			 * can detect when DMA fills it and push data to the client.
-			 * Call refill_buffer directly (async DMA start). */
-			lf256fifo_write(fifo_stream, wr);
-			ret = desc->ops.refill_buffer(&ctx, &data->device, wr);
-			if (NO_OS_IS_ERR_VALUE(ret)) {
-				IIOD_SET_ERROR_RESPONSE(conn->res_header, ret);
-				conn->res.buf.len = 0;
-				conn->state = IIOD_WRITING_BIN_RESPONSE;
-				return 0;
-			}
-		} else {
-			/* Pre-stream: accumulate block_ids for pre_enable */
-			lf256fifo_write(fifo_stream, wr);
-			conn->block_ids[stream->curr] = wr;
-			stream->curr++;
-			if (stream->curr == stream->nb_blocks) {
-				stream->curr = 0;
-			}
+		/*
+		 * Record the credit that fixes the order responses are stamped
+		 * in, and hand the block to the producer. The client enqueues
+		 * before ENABLE_BUFFER on the first round, so anything arriving
+		 * while the stream is stopped is armed by ENABLE_BUFFER instead.
+		 *
+		 * This opcode sends no command response. An unknown block is
+		 * reported at once; an arming failure is not, because the credit
+		 * and the armed queue must stay in step - the block stays queued
+		 * and is answered either when it completes or by the teardown
+		 * path, so it still gets exactly one response.
+		 */
+		entry = iiod_stream_find(stream, data->block_id);
+		if (!entry) {
+			iiod_send_block_error(desc, conn, data->client_id,
+					      data->device, -EINVAL);
+			break;
 		}
+
+		if (lf256fifo_write(fifo_stream, (uint8_t)data->block_id)) {
+			iiod_send_block_error(desc, conn, entry->cl_id,
+					      data->device, -ENOSPC);
+			break;
+		}
+
+		if (stream->started)
+			desc->ops.refill_buffer(&ctx, &data->device,
+						data->block_id);
 		break;
 
 	case IIOD_OP_ENABLE_BUFFER:
-		ret = desc->ops.pre_enable(&ctx, &data->device, cmd_desc->mask, conn->block_ids);
+		conn->res.buf.len = 0;
 
-		//TODO: Send the response to enable properly
-		for (i = 0; i < stream->nb_blocks; i++) {
-			ret = desc->ops.refill_buffer(&ctx, &data->device, conn->block_ids[i]); //TODO: Check if block_ids is to be in conn or stream
-			if (NO_OS_IS_ERR_VALUE(ret)) {
-				goto command_fail;
-			}
+		if (!stream->nb_blocks) {
+			ret = -EINVAL;
+			goto command_fail;
 		}
 
+		ret = desc->ops.pre_enable(&ctx, &data->device, stream->mask);
+		if (NO_OS_IS_ERR_VALUE(ret))
+			goto command_fail;
+
 		stream->started = true;
+
+		/*
+		 * Arm the blocks the client enqueued before enabling, in the
+		 * order their credits were recorded. Credits are put back
+		 * regardless: the armed queue and the credit order must stay in
+		 * step, and a block that failed to arm is still answered by the
+		 * teardown path.
+		 */
+		block_count = 0;
+		while (block_count < MAX_NUM_BLOCKS &&
+		       !lf256fifo_read(fifo_stream, &pending))
+			pending_list[block_count++] = pending;
+
+		for (i = 0; i < (int)block_count; i++) {
+			lf256fifo_write(fifo_stream, pending_list[i]);
+			desc->ops.refill_buffer(&ctx, &data->device,
+						pending_list[i]);
+		}
 
 		break;
 
 	case IIOD_OP_FREE_BLOCK:
-
-//		TODO: The below approach gives heap=0 but results in a 10-sec delay during
-//		destroy buffer(). Need to investigate. But this approach follows clean stop
-//		of transfer and then freeing blocks that were assigned for transfer
-//		conn->res.buf.len = 0;
-//		/* Reverse-order teardown: stop DMA before freeing any block memory.
-//		 * Without this, the DMA ISR can write to blocks_g[map[slot]]->bytes_used
-//		 * after block->data has already been freed, which is use-after-free.
-//		 *
-//		 * ops.close() → iio_close_dev → frees circular buffer → post_disable →
-//		 * end_transfer (stops DMA, resets nb_of_blocks / blocks_g[]).
-//		 *
-//		 * end_transfer resets the APP-level nb_of_blocks but does NOT touch
-//		 * stream->nb_blocks, so the loop below can still iterate correctly. */
-//		if (stream->started) {
-//			stream->started = false;
-//			ret = desc->ops.close(&ctx, &data->device);
-//			if (NO_OS_IS_ERR_VALUE(ret))
-//				goto command_fail;
-//		}
-//
-//		if (stream && stream->blocks) {
-//			for (i = 0; i < stream->nb_blocks; i++) {
-//				if (stream->blocks[i]) {
-//					if (stream->blocks[i]->cl_id == (data->block_id + 1)) {
-//						no_os_free(stream->blocks[i]->data);
-//						stream->blocks[i]->data = NULL;
-//						no_os_free(stream->blocks[i]);
-//						stream->blocks[i] = NULL;
-//						continue;
-//					}
-//					block_count++;
-//				}
-//			}
-//			if (!block_count) {
-//				/* All blocks freed. Reset iiod-layer count so the next session's
-//				 * CREATE_BLOCK starts at index 0. Keep stream->blocks array
-//				 * allocated — it is reused by the next client session.
-//				 * ops.close() was already called above (started guard). */
-//				stream->nb_blocks = 0;
-//			}
-//		}
-
 		conn->res.buf.len = 0;
-		if (stream && stream->blocks) {
-			for (i = 0; i < stream->nb_blocks; i++) {
-				if (stream->blocks[i]) {
-					if (stream->blocks[i]->cl_id == (data->block_id + 1)) {
-						no_os_free(stream->blocks[i]->data);
-						stream->blocks[i]->data = NULL;
-						no_os_free(stream->blocks[i]);
-						stream->blocks[i] = NULL;
-						continue;
-					}
-					block_count++;
-				}
-			}
-			if (!block_count) {
-				/* All blocks freed. Reset iiod-layer count so the next session's
-				 * CREATE_BLOCK starts at index 0. Keep stream->blocks array
-				 * allocated — it is reused by the next client session. */
-				stream->nb_blocks = 0;
+
+		entry = iiod_stream_find(stream, data->block_id);
+		if (entry)
+			entry->live = false;
+
+		for (i = 0; i < (int)stream->nb_blocks; i++)
+			if (stream->blocks[i].live)
+				block_count++;
+
+		if (!block_count) {
+			/*
+			 * Last block: answer anything still enqueued and stop
+			 * the device before the storage is released, because the
+			 * completion context writes into it until then.
+			 */
+			iiod_fail_pending_blocks(desc, conn, -EPIPE);
+			if (stream->started) {
 				stream->started = false;
 				ret = desc->ops.close(&ctx, &data->device);
+				if (NO_OS_IS_ERR_VALUE(ret))
+					goto command_fail;
 			}
+		}
+
+		if (entry)
+			desc->ops.free_block(&ctx, &data->device, data->block_id);
+
+		if (!block_count) {
+			stream->nb_blocks = 0;
 		}
 
 		break;
 
+	case IIOD_OP_DISABLE_BUFFER:
+		/*
+		 * Stop the capture but keep the blocks: the client may enable the
+		 * same buffer again. Blocks still enqueued can no longer be filled,
+		 * so they are answered with an error rather than dropped.
+		 */
+		conn->res.buf.len = 0;
+		iiod_fail_pending_blocks(desc, conn, -ECANCELED);
+		if (stream->started) {
+			stream->started = false;
+			ret = desc->ops.close(&ctx, &data->device);
+			if (NO_OS_IS_ERR_VALUE(ret))
+				goto command_fail;
+		}
+		break;
+
 	case IIOD_OP_CLOSE_BUFFER:
 		conn->res.buf.len = 0;
-		stream->curr = 0;
-		/* Free any blocks not already freed by FREE_BLOCK (abort / error path).
-		 * If nb_blocks is still > 0 here the device was never closed: close it. */
-		if (stream && stream->blocks) {
-			for (i = 0; i < MAX_NUM_BLOCKS; i++) {
-				if (stream->blocks[i]) {
-					no_os_free(stream->blocks[i]->data);
-					stream->blocks[i]->data = NULL;
-					no_os_free(stream->blocks[i]);
-					stream->blocks[i] = NULL;
-				}
-			}
-			if (stream->nb_blocks > 0) {
-				stream->nb_blocks = 0;
-				stream->started = false;
-				ret = desc->ops.close(&ctx, &data->device);
-			}
+		iiod_fail_pending_blocks(desc, conn, -ECANCELED);
+		if (stream->started) {
+			stream->started = false;
+			ret = desc->ops.close(&ctx, &data->device);
+			if (NO_OS_IS_ERR_VALUE(ret))
+				goto command_fail;
 		}
-		/* Drain any stale block IDs from the previous session. */
-		lf256fifo_flush(conn->fifo_stream);
+
+		/* Device is stopped: releasing the block storage is now safe. */
+		for (i = 0; i < (int)stream->nb_blocks; i++)
+			if (stream->blocks[i].live)
+				desc->ops.free_block(&ctx, &data->device,
+						     stream->blocks[i].idx);
+
+		stream->nb_blocks = 0;
+		stream->mask = 0;
 		break;
 
 	case IIOD_OP_RETRY_DEQUEUE_BLOCK:
@@ -1519,39 +1622,101 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 			return 0;
 
 		case IIOD_WRITING_BUF_DATA:
-			if(conn->stream->started) {
-				if(!lf256fifo_is_empty(conn->fifo_stream)) {
-					lf256fifo_get(conn->fifo_stream, &c);  /* peek */
-					if(conn->stream->blocks[c]->bytes_used == conn->stream->blocks[c]->size) {
-						/* Block is filled by DMA — send response + data to client */
-						IIOD_SET_RESPONSE(conn->res_header,
-								conn->stream->blocks[c]->cl_id,
-								0,
-								conn->stream->blocks[c]->size);
-						ret = desc->ops.send(&ctx, (uint8_t *)&conn->res_header,
-								 sizeof(conn->res_header));
+			/*
+			 * Readiness check and header only: production was started
+			 * when the block was enqueued. When the block is not ready
+			 * this falls through to IIOD_READING_LINE so the daemon keeps
+			 * parsing commands while the device fills it.
+			 *
+			 * The device comes from the stream, not from the last parsed
+			 * command: this runs outside the command that enqueued the credit.
+			 */
+			if (conn->stream.started &&
+			    !lf256fifo_is_empty(conn->fifo_stream)) {
+				uint16_t dev_id = conn->stream.dev;
+				struct iiod_block_entry *entry;
+				uint32_t bytes_used;
+				void *addr;
 
-						buff.buf = conn->stream->blocks[c]->data;
-						buff.len = conn->stream->blocks[c]->size;
-						buff.idx = 0;
+				/* Peek: the credit is retired only once the data is sent. */
+				lf256fifo_get(conn->fifo_stream, &c);
 
-						do {
-							ret = rw_iiod_buff(desc, conn,
-									&buff,
-									IIOD_WR);
-						} while (ret == -EAGAIN);
-
-						conn->stream->blocks[c]->bytes_used = 0;
-
-						/* Pop the sent block_id. Empty fifo is normal. */
-						lf256fifo_read(conn->fifo_stream, &c);
-					}
-					/* Block not ready yet — fifo still has block_id (peek, not pop).
-					 * Fall through to IIOD_READING_LINE; next iteration will
-					 * return EAGAIN → loop back here to re-check bytes_used. */
+				/*
+				 * The client may have freed this block while its credit
+				 * was still queued. FREE_BLOCK already answered it, so
+				 * retire the credit silently.
+				 */
+				entry = iiod_stream_find(&conn->stream, c);
+				if (!entry) {
+					lf256fifo_read(conn->fifo_stream, &c);
+					return 0;
 				}
+
+				ret = desc->ops.block_ready(&ctx, &dev_id, c, &addr,
+							    &bytes_used);
+				if (ret == -EAGAIN) {
+					conn->state = IIOD_READING_LINE;
+					return 0;
+				}
+				if (NO_OS_IS_ERR_VALUE(ret)) {
+					lf256fifo_read(conn->fifo_stream, &c);
+					IIOD_SET_RESPONSE(conn->res_header, entry->cl_id,
+							  dev_id, ret);
+					conn->res.buf.len = 0;
+					conn->res.write_val = 0;
+					conn->state = IIOD_WRITING_BIN_RESPONSE;
+					return 0;
+				}
+
+				IIOD_SET_RESPONSE(conn->res_header, entry->cl_id, dev_id,
+						  bytes_used);
+
+				/*
+				 * Header and payload both go out through rw_iiod_buff.
+				 * ops.send returns a byte count and may be short on a
+				 * stream transport (socket_send), so a raw send of the
+				 * header could drop bytes and desynchronise the client;
+				 * rw_iiod_buff resumes from nb_buf.idx instead. The
+				 * STM32 UART backend is all-or-nothing, so this is
+				 * defensive there.
+				 *
+				 * The payload is sent straight out of the block, which
+				 * owns its memory and keeps it until re-enqueued, so no
+				 * staging copy is needed. A zero-length payload needs no
+				 * second pass and falls out of the length check.
+				 */
+				conn->nb_buf.buf = (char *)&conn->res_header;
+				conn->nb_buf.len = sizeof(conn->res_header);
+				conn->nb_buf.idx = 0;
+				conn->res.buf.buf = addr;
+				conn->res.buf.len = bytes_used;
+				conn->res.buf.idx = 0;
+				conn->state = IIOD_RW_BUF;
+				return 0;
 			}
 
+			conn->state = IIOD_READING_LINE;
+			return 0;
+
+		case IIOD_RW_BUF:
+			/* Non-blocking; resume here on -EAGAIN until both are sent. */
+			if (conn->nb_buf.idx < conn->nb_buf.len) {
+				ret = rw_iiod_buff(desc, conn, &conn->nb_buf, IIOD_WR);
+				if (NO_OS_IS_ERR_VALUE(ret))
+					return ret;
+			}
+
+			if (conn->res.buf.idx < conn->res.buf.len) {
+				ret = rw_iiod_buff(desc, conn, &conn->res.buf, IIOD_WR);
+				if (NO_OS_IS_ERR_VALUE(ret))
+					return ret;
+			}
+
+			/* Whole block is on the wire: retire the credit. */
+			conn->nb_buf.len = 0;
+			conn->res.buf.buf = NULL;
+			conn->res.buf.len = 0;
+			lf256fifo_read(conn->fifo_stream, &c);
 			conn->state = IIOD_READING_LINE;
 			return 0;
 

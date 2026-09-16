@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "no_os_circular_buffer.h"
+#include "no_os_lf256fifo.h"
 
 enum iio_val {
 	IIO_VAL_INT = 1,
@@ -233,6 +234,29 @@ struct iio_cyclic_buffer_info {
 	uint32_t buff_index;
 };
 
+/**
+ * @struct iio_block
+ * @brief One libiio v1 block: a contiguous region of the device buffer that the
+ * client has created and may enqueue to be filled.
+ *
+ * Owned by the iio layer. Applications reach a block only through
+ * iio_buffer_get_block() / iio_buffer_block_done() and never name this struct.
+ */
+struct iio_block {
+	/* Region inside iio_buffer_priv::raw_buf */
+	void *data;
+	/* Bytes the client allocated for this block */
+	uint32_t size;
+	/* Bytes produced so far; may be < size when the block completes */
+	uint32_t bytes_used;
+	/* Block index as assigned by the client */
+	uint16_t idx;
+	/* Set when the producer is done with this block */
+	bool done;
+	/* Set while the driver holds this block via iio_buffer_get_block() */
+	bool issued;
+};
+
 struct iio_buffer {
 	/* Mask with active channels */
 	uint32_t active_mask;
@@ -248,24 +272,15 @@ struct iio_buffer {
 	struct no_os_circular_buffer *buf;
 	/* Stores cyclic buffer specific information */
 	struct iio_cyclic_buffer_info cyclic_info;
-};
-
-struct iio_block {
-	struct iio_buffer *buffer;
-	uint8_t *data;
-	uint32_t size;
-	uint16_t cl_id;
-
-	/* Written by the capture ISR, polled by the iiod state machine */
-	volatile uint32_t bytes_used;
-};
-
-struct iio_stream {
-	struct iio_buffer *buffer;
-	struct iio_block **blocks;
-	uint32_t nb_blocks;
-	uint8_t curr;
-	bool started, buf_enabled, all_enqueued;
+	/* Blocks created by the client. NULL selects the v0 circular buffer path. */
+	struct iio_block *blocks;
+	/* Number of entries in blocks[] */
+	uint8_t nb_blocks;
+	/*
+	 * Indices of the blocks handed to the producer, in arming order. Written
+	 * only by the arming context, read/popped only by the completing context.
+	 */
+	struct lf256fifo *armed;
 };
 
 struct __attribute__((packed)) iio_event {
@@ -327,7 +342,7 @@ struct iio_device {
 
 	/* Bufer callbacks */
 	/** Called before enabling buffer */
-	int32_t (*pre_enable)(void *dev, uint32_t mask, uint16_t *block_ids);
+	int32_t (*pre_enable)(void *dev, uint32_t mask);
 	/** Called after disabling buffer */
 	int (*post_disable)(void *dev);
 	/** Called when buffer ready to transfer. Write/read to/from dev */
@@ -339,9 +354,6 @@ struct iio_device {
 	int (*debug_reg_read)(void *dev, uint32_t reg, uint32_t *readval);
 	/* Write device register */
 	int (*debug_reg_write)(void *dev, uint32_t reg, uint32_t writeval);
-
-	int32_t (*create_block)(struct iio_device_data *dev, struct iio_block *block, uint32_t block_size_bytes);
-	int32_t	(*transfer_block)(struct iio_device_data *dev, uint8_t block_id);
 
 };
 

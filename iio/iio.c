@@ -152,7 +152,12 @@ struct iio_buffer_priv {
 	bool			initalized;
 	/* Set when no_os_calloc was used to initalize cb.buf */
 	bool			allocated;
-	uint8_t 		block_ids[MAX_NUM_BLOCKS];
+	/* Storage for public.blocks */
+	struct iio_block	block_store[MAX_NUM_BLOCKS];
+	/* Bump pointer used to carve block slabs out of raw_buf */
+	uint32_t		alloc_offset;
+	/* Set when block memory was taken from the heap instead of raw_buf */
+	bool			blocks_allocated;
 };
 
 struct iio_event_priv {
@@ -1845,22 +1850,266 @@ static uint32_t bytes_per_scan(struct iio_channel *channels, uint32_t mask)
 	return cnt;
 }
 
+/*
+ * libiio v1 block support.
+ *
+ * A block is a contiguous region carved out of raw_buf at CREATE_BLOCK and kept
+ * until the buffer is closed, so its contents stay addressable after the block
+ * has been served. Block indices come from the wire, never from arrival order.
+ *
+ * buffer.armed holds the indices of the blocks handed to the producer, in
+ * arming order. lf256fifo is a single-producer/single-consumer ring: the arming
+ * context only ever writes fempty (lf256fifo_write) and the completing context
+ * only ever writes ffilled (lf256fifo_read), so no lock is needed between the
+ * daemon loop and a driver ISR. This relies on completion being signalled from
+ * exactly one context per device.
+ */
+
+/* Translate a client block index into a slot in block_store[]. */
+static struct iio_block *iio_find_block(struct iio_buffer_priv *buf, uint16_t idx)
+{
+	uint8_t i;
+
+	if (!buf->public.blocks)
+		return NULL;
+
+	for (i = 0; i < buf->public.nb_blocks; i++)
+		if (buf->public.blocks[i].size &&
+		    buf->public.blocks[i].idx == idx)
+			return &buf->public.blocks[i];
+
+	return NULL;
+}
+
+/* Read-only look at the armed head; safe from any context. */
+static struct iio_block *iio_armed_peek(struct iio_buffer *buffer)
+{
+	uint8_t slot;
+
+	if (!buffer->blocks || !buffer->armed)
+		return NULL;
+
+	if (lf256fifo_get(buffer->armed, &slot))
+		return NULL;
+
+	if (slot >= buffer->nb_blocks || !buffer->blocks[slot].size)
+		return NULL;
+
+	return &buffer->blocks[slot];
+}
+
+/*
+ * Armed head for the producer, dropping entries whose block was freed while
+ * still enqueued. Only the completing context may call this: it advances the
+ * consumer index of the armed fifo.
+ */
+static struct iio_block *iio_armed_head(struct iio_buffer *buffer)
+{
+	uint8_t slot;
+
+	if (!buffer->blocks || !buffer->armed)
+		return NULL;
+
+	while (!lf256fifo_get(buffer->armed, &slot)) {
+		if (slot < buffer->nb_blocks && buffer->blocks[slot].size)
+			return &buffer->blocks[slot];
+
+		lf256fifo_read(buffer->armed, &slot);
+	}
+
+	return NULL;
+}
+
+/* Retire the head of the armed queue once the producer is done with it. */
+static void iio_armed_pop(struct iio_buffer *buffer)
+{
+	uint8_t slot;
+
+	lf256fifo_read(buffer->armed, &slot);
+}
+
+static void iio_release_blocks(struct iio_buffer_priv *buf)
+{
+	uint8_t i;
+
+	if (buf->blocks_allocated) {
+		for (i = 0; i < buf->public.nb_blocks; i++)
+			if (buf->public.blocks[i].data)
+				no_os_free(buf->public.blocks[i].data);
+
+		buf->blocks_allocated = false;
+	}
+
+	if (buf->public.armed)
+		lf256fifo_flush(buf->public.armed);
+
+	memset(buf->block_store, 0, sizeof(buf->block_store));
+	buf->public.blocks = NULL;
+	buf->public.nb_blocks = 0;
+	buf->alloc_offset = 0;
+}
+
+/*
+ * Carve one block out of raw_buf. Allocating here rather than at ENABLE_BUFFER
+ * lets blocks differ in size and reports -ENOMEM against the CREATE_BLOCK that
+ * actually overflowed.
+ */
+static int iio_create_block(struct iiod_ctx *ctx, const void *device,
+			    uint16_t block_idx, uint32_t size)
+{
+	struct iio_buffer_priv *buf;
+	struct iio_dev_priv *dev;
+	uint32_t offset;
+	uint8_t slot;
+	int ret;
+
+	if (!ctx || !device || !size)
+		return -EINVAL;
+
+	dev = get_iio_device(ctx->instance, device, ctx->binary);
+	if (!dev || !dev->buffer.initalized)
+		return -EINVAL;
+
+	buf = &dev->buffer;
+
+	if (buf->public.blocks && iio_find_block(buf, block_idx))
+		return -EEXIST;
+
+	if (buf->public.nb_blocks == MAX_NUM_BLOCKS)
+		return -ENOMEM;
+
+	if (!buf->public.armed) {
+		ret = lf256fifo_init(&buf->public.armed);
+		if (NO_OS_IS_ERR_VALUE(ret))
+			return ret;
+	}
+
+	slot = buf->public.nb_blocks;
+
+	if (buf->raw_buf && buf->raw_buf_len) {
+		offset = NO_OS_DIV_ROUND_UP(buf->alloc_offset, sizeof(uint32_t)) *
+			 sizeof(uint32_t);
+		if (offset > buf->raw_buf_len ||
+		    size > buf->raw_buf_len - offset)
+			return -ENOMEM;
+
+		buf->block_store[slot].data = buf->raw_buf + offset;
+		buf->alloc_offset = offset + size;
+	} else {
+		buf->block_store[slot].data = no_os_calloc(1, size);
+		if (!buf->block_store[slot].data)
+			return -ENOMEM;
+
+		buf->blocks_allocated = true;
+	}
+
+	buf->block_store[slot].size = size;
+	buf->block_store[slot].bytes_used = 0;
+	buf->block_store[slot].idx = block_idx;
+	buf->block_store[slot].done = false;
+
+	buf->public.blocks = buf->block_store;
+	buf->public.nb_blocks++;
+
+	return 0;
+}
+
+static int iio_free_block(struct iiod_ctx *ctx, const void *device,
+			  uint16_t block_idx)
+{
+	struct iio_buffer_priv *buf;
+	struct iio_dev_priv *dev;
+	struct iio_block *block;
+	uint8_t i, live = 0;
+
+	if (!ctx || !device)
+		return -EINVAL;
+
+	dev = get_iio_device(ctx->instance, device, ctx->binary);
+	if (!dev || !dev->buffer.initalized)
+		return -EINVAL;
+
+	buf = &dev->buffer;
+	block = iio_find_block(buf, block_idx);
+	if (!block)
+		return -EINVAL;
+
+	/*
+	 * Only the size is cleared here: data must stay valid because the block
+	 * may still be sitting in the armed queue, and raw_buf is bump
+	 * allocated so a single slab cannot be reclaimed on its own. Everything
+	 * comes back once the client has freed the last block, by which point
+	 * the caller has already stopped the device.
+	 */
+	block->size = 0;
+	block->bytes_used = 0;
+	block->done = false;
+
+	for (i = 0; i < buf->public.nb_blocks; i++)
+		if (buf->public.blocks[i].size)
+			live++;
+
+	if (!live)
+		iio_release_blocks(buf);
+
+	return 0;
+}
+
+/*
+ * Non-blocking equivalent of iio_block_dequeue: report whether the producer has
+ * finished, and where the data is. The block keeps its contents, so the address
+ * stays valid until the block is re-enqueued or released.
+ */
+static int iio_block_ready(struct iiod_ctx *ctx, const void *device,
+			   uint16_t block_idx, void **addr, uint32_t *bytes_used)
+{
+	struct iio_dev_priv *dev;
+	struct iio_block *block;
+
+	if (!ctx || !device || !addr || !bytes_used)
+		return -EINVAL;
+
+	dev = get_iio_device(ctx->instance, device, ctx->binary);
+	if (!dev || !dev->buffer.initalized)
+		return -EINVAL;
+
+	block = iio_find_block(&dev->buffer, block_idx);
+	if (!block)
+		return -EINVAL;
+
+	if (!block->done)
+		return -EAGAIN;
+
+	*addr = block->data;
+	*bytes_used = block->bytes_used;
+
+	return 0;
+}
+
 /**
- * @brief  Open device.
+ * @brief  Open a device buffer of a given size in bytes.
+ *
+ * The ASCII path knows a sample count, the binary (libiio v1) path knows a
+ * block size in bytes, so both are expressed here in bytes. buffer_size becomes
+ * buffer.public.size, which is also the granule the raw buffer is partitioned
+ * into: the circular buffer is rounded down to a whole number of these, so a
+ * block never straddles the ring wrap and can always be served contiguously.
+ *
  * @param ctx - IIO instance and conn instance
  * @param device - String containing device name.
- * @param sample_size - Sample size.
+ * @param buffer_size - Size in bytes of one transfer unit.
  * @param mask - Channels to be opened.
+ * @param cyclic - Set for a cyclic buffer.
  * @return 0, negative value in case of failure.
  */
-static int iio_open_dev(struct iiod_ctx *ctx, const void *device,
-			uint32_t samples, uint32_t mask, bool cyclic)
+static int iio_open_dev_bytes(struct iiod_ctx *ctx, const void *device,
+			      uint32_t buffer_size, uint32_t mask, bool cyclic)
 {
 	struct iio_desc *desc;
 	struct iio_dev_priv *dev;
 	struct iio_trig_priv *trig;
 	uint32_t ch_mask;
-	int32_t ret;
+	int32_t ret = 0;
 	int8_t *buf;
 	uint32_t buf_size;
 
@@ -1882,8 +2131,31 @@ static int iio_open_dev(struct iiod_ctx *ctx, const void *device,
 	dev->buffer.public.active_mask = mask;
 	dev->buffer.public.bytes_per_scan =
 		bytes_per_scan(dev->dev_descriptor->channels, mask);
-	dev->buffer.public.size = dev->buffer.public.bytes_per_scan * samples;
-	dev->buffer.public.samples = samples;
+	if (!dev->buffer.public.bytes_per_scan)
+		return -EINVAL;
+
+	if (!buffer_size)
+		return -EINVAL;
+
+	/*
+	 * A block need not be a whole number of scans: it simply completes
+	 * short and the response carries the real byte count. The ASCII path
+	 * has no such notion and keeps the strict check.
+	 */
+	if (!dev->buffer.public.blocks &&
+	    (buffer_size % dev->buffer.public.bytes_per_scan))
+		return -EINVAL;
+
+	dev->buffer.public.size = buffer_size;
+	dev->buffer.public.samples = buffer_size / dev->buffer.public.bytes_per_scan;
+
+	/*
+	 * In block mode the slabs are already carved out of raw_buf, so the
+	 * circular buffer must not be configured over the same memory.
+	 */
+	if (dev->buffer.public.blocks)
+		goto enable;
+
 	if (dev->buffer.raw_buf && dev->buffer.raw_buf_len) {
 		if (dev->buffer.raw_buf_len < dev->buffer.public.size)
 			/* Need a bigger buffer or to allocate */
@@ -1914,8 +2186,9 @@ static int iio_open_dev(struct iiod_ctx *ctx, const void *device,
 		return ret;
 	}
 
+enable:
 	if (dev->dev_descriptor->pre_enable) {
-		ret = dev->dev_descriptor->pre_enable(dev->dev_instance, mask, NULL);
+		ret = dev->dev_descriptor->pre_enable(dev->dev_instance, mask);
 		if (NO_OS_IS_ERR_VALUE(ret)) {
 			if (dev->buffer.allocated) {
 				no_os_free(dev->buffer.cb.buff);
@@ -1933,6 +2206,36 @@ static int iio_open_dev(struct iiod_ctx *ctx, const void *device,
 	}
 
 	return ret;
+}
+
+/**
+ * @brief  Open device (ASCII path: size expressed as a sample count).
+ * @param ctx - IIO instance and conn instance
+ * @param device - String containing device name.
+ * @param samples - Number of samples per transfer.
+ * @param mask - Channels to be opened.
+ * @param cyclic - Set for a cyclic buffer.
+ * @return 0, negative value in case of failure.
+ */
+static int iio_open_dev(struct iiod_ctx *ctx, const void *device,
+			uint32_t samples, uint32_t mask, bool cyclic)
+{
+	struct iio_dev_priv *dev;
+	uint32_t ch_mask;
+
+	dev = get_iio_device(ctx->instance, device, ctx->binary);
+	if (!dev)
+		return -ENODEV;
+
+	ch_mask = 0xFFFFFFFF >> (32 - dev->dev_descriptor->num_ch);
+	mask &= ch_mask;
+	if (!mask)
+		return -ENOENT;
+
+	return iio_open_dev_bytes(ctx, device,
+				  bytes_per_scan(dev->dev_descriptor->channels,
+						 mask) * samples,
+				  mask, cyclic);
 }
 
 /**
@@ -1975,6 +2278,15 @@ static int iio_close_dev(struct iiod_ctx *ctx, const void *device)
 	if (dev->dev_descriptor->post_disable)
 		ret = dev->dev_descriptor->post_disable(dev->dev_instance);
 
+	/*
+	 * Only now: post_disable is what stops the device, and its completion
+	 * context may still be writing into a block until it returns. The blocks
+	 * themselves survive, because DISABLE_BUFFER may be followed by another
+	 * ENABLE_BUFFER on the same blocks.
+	 */
+	if (dev->buffer.public.armed)
+		lf256fifo_flush(dev->buffer.public.armed);
+
 	return ret;
 }
 
@@ -1982,12 +2294,25 @@ static int iio_call_submit(struct iiod_ctx *ctx, const void *device,
 			   enum iio_buffer_direction dir)
 {
 	struct iio_dev_priv *dev;
+	struct iio_block *armed;
 
 	dev = get_iio_device(ctx->instance, device, ctx->binary);
 	if (!dev || !dev->buffer.initalized)
 		return -EINVAL;
 
 	dev->buffer.public.dir = dir;
+
+	/*
+	 * Drivers read buffer->size / buffer->samples to know how much to
+	 * produce, so in block mode they must describe the block being filled.
+	 */
+	armed = iio_armed_peek(&dev->buffer.public);
+	if (armed) {
+		dev->buffer.public.size = armed->size;
+		dev->buffer.public.samples = dev->buffer.public.bytes_per_scan ?
+					     armed->size / dev->buffer.public.bytes_per_scan : 0;
+	}
+
 	if (dev->dev_descriptor->submit && dev->trig_idx == NO_TRIGGER)
 		return dev->dev_descriptor->submit(&dev->dev_data);
 	else if ((dir == IIO_DIRECTION_INPUT && dev->dev_descriptor->read_dev
@@ -2023,25 +2348,77 @@ static int iio_push_buffer(struct iiod_ctx *ctx, const void *device)
 	return iio_call_submit(ctx, device, IIO_DIRECTION_OUTPUT);
 }
 
-static int iio_refill_buffer(struct iiod_ctx *ctx, const void *device, uint8_t block_id)
+/**
+ * @brief Make a block available to the producer.
+ *
+ * Equivalent of libiio's iio_block_enqueue: it hands the block over and
+ * returns. In block mode submit() is expected to start production and return,
+ * with completion signalled later through iio_buffer_block_done() or by
+ * iio_buffer_push_scan() filling the block. A synchronous driver simply
+ * completes before returning.
+ *
+ * @param ctx - IIO instance and conn instance.
+ * @param device - Device index.
+ * @param block_idx - Client block index, or 0 on the ASCII path.
+ * @return 0, negative value in case of failure.
+ */
+static int iio_refill_buffer(struct iiod_ctx *ctx, const void *device,
+			     uint16_t block_idx)
 {
+	struct iio_buffer_priv *buf;
 	struct iio_dev_priv *dev;
+	struct iio_block *block;
+	struct iio_block *head;
 
-	if (ctx->binary){
-		dev = get_iio_device(ctx->instance, device, ctx->binary);
-		if (!dev || !dev->buffer.initalized)
-			return -EINVAL;
+	dev = get_iio_device(ctx->instance, device, ctx->binary);
+	if (!dev || !dev->buffer.initalized)
+		return -EINVAL;
 
-		if (dev->dev_descriptor->transfer_block && dev->trig_idx == NO_TRIGGER)
-			return dev->dev_descriptor->transfer_block(&dev->dev_data, block_id);
-	}
+	buf = &dev->buffer;
+	if (!buf->public.blocks)
+		return iio_call_submit(ctx, device, IIO_DIRECTION_INPUT);
+
+	block = iio_find_block(buf, block_idx);
+	if (!block || !block->size)
+		return -EINVAL;
+
+	block->bytes_used = 0;
+	block->done = false;
+	block->issued = false;
+
+	if (lf256fifo_write(buf->public.armed,
+			    (uint8_t)(block - buf->public.blocks)))
+		return -ENOSPC;
+
+	/*
+	 * One block is produced at a time, so only kick the driver when it has
+	 * nothing outstanding; otherwise it picks this one up when the block it
+	 * is filling completes. Leaving the entry queued on failure is what
+	 * keeps the armed queue in step with the daemon's credit order.
+	 */
+	head = iio_armed_peek(&buf->public);
+	if (head && head->issued)
+		return 0;
 
 	return iio_call_submit(ctx, device, IIO_DIRECTION_INPUT);
 }
 
-static int iio_pre_enable(struct iiod_ctx *ctx, const void *device, uint32_t mask, uint16_t *block_ids)
+/**
+ * @brief Configure and enable a device buffer for the binary (libiio v1) path.
+ *
+ * The blocks already exist, so the buffer geometry is taken from them. The
+ * circular buffer is deliberately left unconfigured: block storage was carved
+ * out of the same raw_buf and the two must not alias.
+ *
+ * @param ctx - IIO instance and conn instance.
+ * @param device - Device index.
+ * @param mask - Channels to be opened.
+ * @return 0, negative value in case of failure.
+ */
+static int iio_pre_enable(struct iiod_ctx *ctx, const void *device, uint32_t mask)
 {
 	struct iio_dev_priv *dev;
+	uint8_t i;
 
 	if (!ctx || !device)
 		return -EINVAL;
@@ -2049,14 +2426,19 @@ static int iio_pre_enable(struct iiod_ctx *ctx, const void *device, uint32_t mas
 		return -ENOSYS;
 
 	dev = get_iio_device(ctx->instance, device, ctx->binary);
-	if (!dev)
+	if (!dev || !dev->buffer.initalized)
 		return -EINVAL;
 
-	if (dev->dev_descriptor->pre_enable) {
-		return dev->dev_descriptor->pre_enable(dev->dev_instance, mask, block_ids);
-	}
+	if (!dev->buffer.public.blocks || !dev->buffer.public.nb_blocks)
+		return -EINVAL;
 
-	return 0;
+	for (i = 0; i < dev->buffer.public.nb_blocks; i++)
+		if (dev->buffer.public.blocks[i].size)
+			return iio_open_dev_bytes(ctx, device,
+						  dev->buffer.public.blocks[i].size,
+						  mask, false);
+
+	return -EINVAL;
 }
 
 static int iio_create_event_stream (struct iiod_ctx *ctx, const void *device,
@@ -2233,31 +2615,28 @@ static int iio_write_buffer(struct iiod_ctx *ctx, const void *device,
 	return bytes;
 }
 
-static int iio_create_block(struct iiod_ctx *ctx, const void *device, struct iio_block *block, uint32_t block_size_bytes)
-{
-	struct iio_dev_priv *dev = NULL;
-
-	if (!ctx || !device)
-		return -EINVAL;
-	if (!ctx->binary)
-		return -ENOSYS; /* ASCII mode not supported */
-
-	dev = get_iio_device(ctx->instance, device, ctx->binary);
-	if (!dev)
-		return -EINVAL;
-
-	if (dev->dev_descriptor->create_block)
-		return dev->dev_descriptor->create_block(dev->dev_instance, block, block_size_bytes);
-
-	return -ENOSYS;
-}
-
 int iio_buffer_get_block(struct iio_buffer *buffer, void **addr)
 {
+	struct iio_block *block;
 	uint32_t size;
 
-	if (!buffer)
+	if (!buffer || !addr)
 		return -EINVAL;
+
+	if (buffer->blocks) {
+		/*
+		 * Peek, never pop: reclaiming dead entries is reserved for the
+		 * completing context so the armed fifo keeps a single writer per
+		 * index. One block is outstanding at a time.
+		 */
+		block = iio_armed_peek(buffer);
+		if (!block || block->issued)
+			return -EAGAIN;
+
+		block->issued = true;
+		*addr = block->data;
+		return 0;
+	}
 
 	if (buffer->dir == IIO_DIRECTION_INPUT)
 		return no_os_cb_prepare_async_write(buffer->buf, buffer->size, addr, &size);
@@ -2267,8 +2646,22 @@ int iio_buffer_get_block(struct iio_buffer *buffer, void **addr)
 
 int iio_buffer_block_done(struct iio_buffer *buffer)
 {
+	struct iio_block *block;
+
 	if (!buffer)
 		return -EINVAL;
+
+	if (buffer->blocks) {
+		block = iio_armed_head(buffer);
+		if (!block)
+			return -EINVAL;
+
+		block->bytes_used = block->size;
+		block->done = true;
+		iio_armed_pop(buffer);
+
+		return 0;
+	}
 
 	if (buffer->dir == IIO_DIRECTION_INPUT)
 		return no_os_cb_end_async_write(buffer->buf);
@@ -2279,8 +2672,35 @@ int iio_buffer_block_done(struct iio_buffer *buffer)
 /* Write to buffer iio_buffer.bytes_per_scan bytes from data */
 int iio_buffer_push_scan(struct iio_buffer *buffer, void *data)
 {
-	if (!buffer)
+	struct iio_block *block;
+
+	if (!buffer || !data)
 		return -EINVAL;
+
+	if (buffer->blocks) {
+		block = iio_armed_head(buffer);
+		if (!block)
+			return -EAGAIN;
+
+		if (block->size - block->bytes_used < buffer->bytes_per_scan)
+			return -EAGAIN;
+
+		memcpy((char *)block->data + block->bytes_used, data,
+		       buffer->bytes_per_scan);
+		block->bytes_used += buffer->bytes_per_scan;
+
+		/*
+		 * Complete as soon as another scan would not fit, so a block
+		 * size that is not a multiple of bytes_per_scan simply ends
+		 * short and the response carries the real byte count.
+		 */
+		if (block->size - block->bytes_used < buffer->bytes_per_scan) {
+			block->done = true;
+			iio_armed_pop(buffer);
+		}
+
+		return 0;
+	}
 
 	return no_os_cb_write(buffer->buf, data, buffer->bytes_per_scan);
 }
@@ -2288,10 +2708,31 @@ int iio_buffer_push_scan(struct iio_buffer *buffer, void *data)
 /* Read from buffer iio_buffer.bytes_per_scan bytes into data */
 int iio_buffer_pop_scan(struct iio_buffer *buffer, void *data)
 {
-	if (!buffer)
+	struct iio_block *block;
+	int ret;
+
+	if (!buffer || !data)
 		return -EINVAL;
 
-	int ret;
+	if (buffer->blocks) {
+		block = iio_armed_head(buffer);
+		if (!block)
+			return -EAGAIN;
+
+		if (block->size - block->bytes_used < buffer->bytes_per_scan)
+			return -EAGAIN;
+
+		memcpy(data, (char *)block->data + block->bytes_used,
+		       buffer->bytes_per_scan);
+		block->bytes_used += buffer->bytes_per_scan;
+
+		if (block->size - block->bytes_used < buffer->bytes_per_scan) {
+			block->done = true;
+			iio_armed_pop(buffer);
+		}
+
+		return 0;
+	}
 
 	ret = no_os_cb_read(buffer->buf, data, buffer->bytes_per_scan);
 
@@ -2927,13 +3368,15 @@ int iio_init(struct iio_desc **desc, struct iio_init_param *init_param)
 	ops->read_buffer = iio_read_buffer;
 	ops->write_buffer = iio_write_buffer;
 	ops->refill_buffer = iio_refill_buffer;
+	ops->create_block = iio_create_block;
+	ops->free_block = iio_free_block;
+	ops->block_ready = iio_block_ready;
 	ops->push_buffer = iio_push_buffer;
 	ops->open = iio_open_dev;
 	ops->close = iio_close_dev;
 	ops->send = iio_send;
 	ops->recv = iio_recv;
 	ops->set_buffers_count = iio_set_buffers_count;
-	ops->create_block = iio_create_block;
 	ops->pre_enable = iio_pre_enable;
 	ops->create_event_stream = iio_create_event_stream;
 	ops->read_event = iio_read_event;
