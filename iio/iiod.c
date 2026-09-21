@@ -1576,6 +1576,10 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 
 	uint8_t c;
 	static struct iiod_buff buff;
+#ifdef ADMAG_TIMING_PROBE
+	extern volatile uint8_t  g_probe_depth;
+	extern volatile uint8_t *g_probe_block_ptr;
+#endif
 	switch (conn->state) {
 		case IIOD_WRITING_EVENT_DATA:
 			uint32_t i;
@@ -1671,6 +1675,15 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 				IIOD_SET_RESPONSE(conn->res_header, entry->cl_id, dev_id,
 						  bytes_used);
 
+#ifdef ADMAG_TIMING_PROBE
+				/* iio_ts at +16: DWT when iiod claims the block.
+				 * Also arm the block pointer so the USB layer can
+				 * write uart_ts (+20) and stack_ts (+24). */
+				*(volatile uint32_t *)((uint8_t *)addr + 16U) =
+					*(volatile uint32_t *)0xE0001004UL;
+				g_probe_block_ptr = (uint8_t *)addr;
+#endif
+
 				/*
 				 * Header and payload both go out through rw_iiod_buff.
 				 * ops.send returns a byte count and may be short on a
@@ -1707,7 +1720,20 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 			}
 
 			if (conn->res.buf.idx < conn->res.buf.len) {
+#ifdef ADMAG_TIMING_PROBE
+				/* First byte of data payload: arm USB-level stamps.
+				 * Header (nb_buf) was sent above with depth==0,
+				 * so uart_ts / stack_ts are never written for it. */
+				if (conn->res.buf.idx == 0)
+					g_probe_depth++;
+#endif
 				ret = rw_iiod_buff(desc, conn, &conn->res.buf, IIOD_WR);
+#ifdef ADMAG_TIMING_PROBE
+				/* STM32 UART is all-or-nothing: payload is fully
+				 * on the wire after rw_iiod_buff returns. */
+				if (g_probe_depth > 0)
+					g_probe_depth--;
+#endif
 				if (NO_OS_IS_ERR_VALUE(ret))
 					return ret;
 			}
@@ -1717,6 +1743,9 @@ static int32_t iiod_run_state_bin(struct iiod_desc *desc,
 			conn->res.buf.buf = NULL;
 			conn->res.buf.len = 0;
 			lf256fifo_read(conn->fifo_stream, &c);
+#ifdef ADMAG_TIMING_PROBE
+			g_probe_block_ptr = NULL;
+#endif
 			conn->state = IIOD_READING_LINE;
 			return 0;
 

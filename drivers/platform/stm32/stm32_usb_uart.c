@@ -132,6 +132,23 @@ static uint8_t CDC_Transmit(uint8_t* Buf, uint16_t Len)
 		return USBD_BUSY;
 
 	USBD_CDC_SetTxBuffer(gusbdevice, Buf, Len);
+
+#ifdef ADMAG_TIMING_PROBE
+	/* stack_ts at +24: DWT just before USB DMA is armed.
+	 * Only written for the data payload (g_probe_depth > 0) and
+	 * only once per block (slot pre-zeroed by ISR; check guards re-entry). */
+	{
+		extern volatile uint8_t  g_probe_depth;
+		extern volatile uint8_t *g_probe_block_ptr;
+		if (g_probe_depth > 0 && g_probe_block_ptr != NULL) {
+			volatile uint32_t *slot =
+				(volatile uint32_t *)(g_probe_block_ptr + 24U);
+			if (*slot == 0U)
+				*slot = *(volatile uint32_t *)0xE0001004UL;
+		}
+	}
+#endif
+
 	result = USBD_CDC_TransmitPacket(gusbdevice);
 
 	return result;
@@ -293,6 +310,23 @@ static int32_t stm32_usb_uart_write(struct no_os_uart_desc *desc,
 	unsigned int len = no_os_min(bytes_number, STM32_USB_CDC_ACM_TXBUF_LEN);
 
 	tx_pending = 1;
+
+#ifdef ADMAG_TIMING_PROBE
+	/* uart_ts at +20: DWT just before CDC_Transmit is called.
+	 * Only written for the data payload (g_probe_depth > 0) and
+	 * only once per block (slot pre-zeroed by ISR; check guards re-entry). */
+	{
+		extern volatile uint8_t  g_probe_depth;
+		extern volatile uint8_t *g_probe_block_ptr;
+		if (g_probe_depth > 0 && g_probe_block_ptr != NULL) {
+			volatile uint32_t *slot =
+				(volatile uint32_t *)(g_probe_block_ptr + 20U);
+			if (*slot == 0U)
+				*slot = *(volatile uint32_t *)0xE0001004UL;
+		}
+	}
+#endif
+
 	ret = CDC_Transmit(data, len);
 	if (ret) {
 		tx_pending = 0;
