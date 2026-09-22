@@ -336,6 +336,19 @@ static int32_t stm32_usb_uart_write(struct no_os_uart_desc *desc,
 	while (tx_pending)
 		;
 
+#ifdef ADMAG_TIMING_PROBE
+	/* tx_done_ts: DWT right after the data payload USB DMA completes.
+	 * Only stamped for the data send (g_probe_depth > 0); the header send
+	 * runs with depth == 0 so it is never stamped here.
+	 * Saved into g_prev_tx_done_ts; the next ISR embeds it in block +28. */
+	{
+		extern volatile uint8_t  g_probe_depth;
+		extern volatile uint32_t g_prev_tx_done_ts;
+		if (g_probe_depth > 0)
+			g_prev_tx_done_ts = *(volatile uint32_t *)0xE0001004UL;
+	}
+#endif
+
 	return len;
 #endif
 }

@@ -2382,6 +2382,16 @@ static int iio_refill_buffer(struct iiod_ctx *ctx, const void *device,
 	if (!block || !block->size)
 		return -EINVAL;
 
+#ifdef ADMAG_TIMING_PROBE
+	/* block_free_ts: DWT at the moment block->done is cleared, meaning the
+	 * block is being re-armed for the ISR to fill again.  Saved into
+	 * g_prev_block_free_ts; the next ISR embeds it in block at offset +32.
+	 * 0xE0001004 is the ARM Cortex-M DWT CYCCNT register. */
+	{
+		extern volatile uint32_t g_prev_block_free_ts;
+		g_prev_block_free_ts = *(volatile uint32_t *)0xE0001004UL;
+	}
+#endif
 	block->bytes_used = 0;
 	block->done = false;
 	block->issued = false;
