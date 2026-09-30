@@ -2368,7 +2368,7 @@ static int iio_refill_buffer(struct iiod_ctx *ctx, const void *device,
 	struct iio_buffer_priv *buf;
 	struct iio_dev_priv *dev;
 	struct iio_block *block;
-	struct iio_block *head;
+//	struct iio_block *head;
 
 	dev = get_iio_device(ctx->instance, device, ctx->binary);
 	if (!dev || !dev->buffer.initalized)
@@ -2390,15 +2390,15 @@ static int iio_refill_buffer(struct iiod_ctx *ctx, const void *device,
 			    (uint8_t)(block - buf->public.blocks)))
 		return -ENOSPC;
 
-	/*
-	 * One block is produced at a time, so only kick the driver when it has
-	 * nothing outstanding; otherwise it picks this one up when the block it
-	 * is filling completes. Leaving the entry queued on failure is what
-	 * keeps the armed queue in step with the daemon's credit order.
-	 */
-	head = iio_armed_peek(&buf->public);
-	if (head && head->issued)
-		return 0;
+//	/*
+//	 * One block is produced at a time, so only kick the driver when it has
+//	 * nothing outstanding; otherwise it picks this one up when the block it
+//	 * is filling completes. Leaving the entry queued on failure is what
+//	 * keeps the armed queue in step with the daemon's credit order.
+//	 */
+//	head = iio_armed_peek(&buf->public);
+//	if (head && head->issued)
+//		return 0;
 
 	return iio_call_submit(ctx, device, IIO_DIRECTION_INPUT);
 }
@@ -2703,6 +2703,42 @@ int iio_buffer_push_scan(struct iio_buffer *buffer, void *data)
 	}
 
 	return no_os_cb_write(buffer->buf, data, buffer->bytes_per_scan);
+}
+
+/*
+ * Write an arbitrary number of bytes from data into the buffer. Same
+ * completion/rearm behavior as iio_buffer_push_scan(), except the caller
+ * picks the chunk size instead of it being fixed to one scan - for producers
+ * that fill a block in a few large DMA-sized chunks rather than one scan at
+ * a time.
+ */
+int iio_buffer_push_data(struct iio_buffer *buffer, void *data, uint32_t size)
+{
+	struct iio_block *block;
+
+	if (!buffer || !data || !size)
+		return -EINVAL;
+
+	if (buffer->blocks) {
+		block = iio_armed_head(buffer);
+		if (!block)
+			return -EAGAIN;
+
+		if (block->size - block->bytes_used < size)
+			return -EAGAIN;
+
+		memcpy((char *)block->data + block->bytes_used, data, size);
+		block->bytes_used += size;
+
+		if (block->size - block->bytes_used < buffer->bytes_per_scan) {
+			block->done = true;
+			iio_armed_pop(buffer);
+		}
+
+		return 0;
+	}
+
+	return no_os_cb_write(buffer->buf, data, size);
 }
 
 /* Read from buffer iio_buffer.bytes_per_scan bytes into data */
