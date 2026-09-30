@@ -49,6 +49,7 @@ int lf256fifo_write(struct lf256fifo *, uint8_t);
 void lf256fifo_flush(struct lf256fifo *);
 void lf256fifo_remove(struct lf256fifo *fifo);
 int lf256fifo_get(struct lf256fifo * fifo, uint8_t *c);
+int lf256fifo_peek_at(struct lf256fifo *fifo, uint8_t offset, uint8_t *c);
 
 #endif
 
