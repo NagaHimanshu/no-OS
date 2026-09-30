@@ -2368,7 +2368,7 @@ static int iio_refill_buffer(struct iiod_ctx *ctx, const void *device,
 	struct iio_buffer_priv *buf;
 	struct iio_dev_priv *dev;
 	struct iio_block *block;
-	struct iio_block *head;
+//	struct iio_block *head;
 
 	dev = get_iio_device(ctx->instance, device, ctx->binary);
 	if (!dev || !dev->buffer.initalized)
@@ -2400,15 +2400,15 @@ static int iio_refill_buffer(struct iiod_ctx *ctx, const void *device,
 			    (uint8_t)(block - buf->public.blocks)))
 		return -ENOSPC;
 
-	/*
-	 * One block is produced at a time, so only kick the driver when it has
-	 * nothing outstanding; otherwise it picks this one up when the block it
-	 * is filling completes. Leaving the entry queued on failure is what
-	 * keeps the armed queue in step with the daemon's credit order.
-	 */
-	head = iio_armed_peek(&buf->public);
-	if (head && head->issued)
-		return 0;
+//	/*
+//	 * One block is produced at a time, so only kick the driver when it has
+//	 * nothing outstanding; otherwise it picks this one up when the block it
+//	 * is filling completes. Leaving the entry queued on failure is what
+//	 * keeps the armed queue in step with the daemon's credit order.
+//	 */
+//	head = iio_armed_peek(&buf->public);
+//	if (head && head->issued)
+//		return 0;
 
 	return iio_call_submit(ctx, device, IIO_DIRECTION_INPUT);
 }
