@@ -240,7 +240,8 @@ struct iio_cyclic_buffer_info {
  * client has created and may enqueue to be filled.
  *
  * Owned by the iio layer. Applications reach a block only through
- * iio_buffer_get_block() / iio_buffer_block_done() and never name this struct.
+ * iio_buffer_get_block() / iio_buffer_get_next_block() / iio_buffer_block_done()
+ * and never name this struct.
  */
 struct iio_block {
 	/* Region inside iio_buffer_priv::raw_buf */

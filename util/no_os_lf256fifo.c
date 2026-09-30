@@ -120,6 +120,26 @@ int lf256fifo_get(struct lf256fifo * fifo, uint8_t *c)
 }
 
 /**
+* @brief Peek an element behind the head without consuming it or anything
+*        ahead of it. offset 0 is the same element lf256fifo_get() returns.
+* @param fifo - pointer to fifo descriptor.
+* @param offset - how many elements behind the head to look.
+* @param c - pointer to memory where the char element is read.
+* @return 0 if successful, -1 if fewer than offset + 1 elements are queued.
+*/
+int lf256fifo_peek_at(struct lf256fifo *fifo, uint8_t offset, uint8_t *c)
+{
+	uint8_t count = fifo->fempty - fifo->ffilled; // wraps at 256, same as is_full/is_empty
+
+	if (offset >= count)
+		return -1;
+
+	*c = fifo->data[(uint8_t)(fifo->ffilled + offset)];
+
+	return 0;
+}
+
+/**
 * @brief Write char to fifo.
 * @param fifo - pointer to fifo descriptor.
 * @param c - char element to write.

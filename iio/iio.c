@@ -1899,6 +1899,29 @@ static struct iio_block *iio_armed_peek(struct iio_buffer *buffer)
 }
 
 /*
+ * Read-only look at the entry queued behind the armed head, without
+ * disturbing the head or consuming anything. Lets a producer line up a
+ * replacement block before the current one is retired via
+ * iio_buffer_block_done(), e.g. to DMA ping-pong directly into IIO blocks
+ * with no intermediate copy.
+ */
+static struct iio_block *iio_armed_peek_next(struct iio_buffer *buffer)
+{
+	uint8_t slot;
+
+	if (!buffer->blocks || !buffer->armed)
+		return NULL;
+
+	if (lf256fifo_peek_at(buffer->armed, 1, &slot))
+		return NULL;
+
+	if (slot >= buffer->nb_blocks || !buffer->blocks[slot].size)
+		return NULL;
+
+	return &buffer->blocks[slot];
+}
+
+/*
  * Armed head for the producer, dropping entries whose block was freed while
  * still enqueued. Only the completing context may call this: it advances the
  * consumer index of the armed fifo.
@@ -2642,6 +2665,32 @@ int iio_buffer_get_block(struct iio_buffer *buffer, void **addr)
 		return no_os_cb_prepare_async_write(buffer->buf, buffer->size, addr, &size);
 
 	return no_os_cb_prepare_async_read(buffer->buf, buffer->size, addr, &size);
+}
+
+/*
+ * Peek the block queued behind the current head without retiring the head,
+ * so a producer can line up where to write next before the block it is
+ * currently filling is handed off via iio_buffer_block_done(). Only
+ * meaningful on the v1 block path.
+ */
+int iio_buffer_get_next_block(struct iio_buffer *buffer, void **addr)
+{
+	struct iio_block *block;
+
+	if (!buffer || !addr)
+		return -EINVAL;
+
+	if (!buffer->blocks)
+		return -EINVAL;
+
+	block = iio_armed_peek_next(buffer);
+	if (!block || block->issued)
+		return -EAGAIN;
+
+	block->issued = true;
+	*addr = block->data;
+
+	return 0;
 }
 
 int iio_buffer_block_done(struct iio_buffer *buffer)
