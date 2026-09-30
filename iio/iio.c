@@ -2715,6 +2715,42 @@ int iio_buffer_push_scan(struct iio_buffer *buffer, void *data)
 	return no_os_cb_write(buffer->buf, data, buffer->bytes_per_scan);
 }
 
+/*
+ * Write an arbitrary number of bytes from data into the buffer. Same
+ * completion/rearm behavior as iio_buffer_push_scan(), except the caller
+ * picks the chunk size instead of it being fixed to one scan - for producers
+ * that fill a block in a few large DMA-sized chunks rather than one scan at
+ * a time.
+ */
+int iio_buffer_push_data(struct iio_buffer *buffer, void *data, uint32_t size)
+{
+	struct iio_block *block;
+
+	if (!buffer || !data || !size)
+		return -EINVAL;
+
+	if (buffer->blocks) {
+		block = iio_armed_head(buffer);
+		if (!block)
+			return -EAGAIN;
+
+		if (block->size - block->bytes_used < size)
+			return -EAGAIN;
+
+		memcpy((char *)block->data + block->bytes_used, data, size);
+		block->bytes_used += size;
+
+		if (block->size - block->bytes_used < buffer->bytes_per_scan) {
+			block->done = true;
+			iio_armed_pop(buffer);
+		}
+
+		return 0;
+	}
+
+	return no_os_cb_write(buffer->buf, data, size);
+}
+
 /* Read from buffer iio_buffer.bytes_per_scan bytes into data */
 int iio_buffer_pop_scan(struct iio_buffer *buffer, void *data)
 {

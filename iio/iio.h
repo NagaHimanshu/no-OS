@@ -139,6 +139,8 @@ int iio_buffer_block_done(struct iio_buffer *buffer);
 int iio_buffer_push_scan(struct iio_buffer *buffer, void *data);
 /* Read from buffer iio_buffer.bytes_per_scan bytes into data */
 int iio_buffer_pop_scan(struct iio_buffer *buffer, void *data);
+/* Write an arbitrary number of bytes from data into the buffer */
+int iio_buffer_push_data(struct iio_buffer *buffer, void *data, uint32_t size);
 
 /* Event functions. */
 int iio_set_event(struct iio_desc *desc, struct iio_device *device,
